@@ -1,11 +1,16 @@
 //! Queue of outgoing packets.
 
 use MAX_WINDOW_SIZE;
-use packet::{self, Packet};
+use packet::{self, Packet, HEADER_LEN};
 
-use std::io;
+use std::{cmp, io};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
+
+// TODO:
+//
+// * Nagle check, don't flush the last data packet if there is in-flight data
+//   and it is too small.
 
 #[derive(Debug)]
 pub struct OutQueue {
@@ -13,6 +18,14 @@ pub struct OutQueue {
     packets: VecDeque<Entry>,
 
     state: State,
+
+    // Round trip time in microseconds
+    rtt: u64,
+    rtt_variance: i64,
+
+    // Max number of bytes that we can have in-flight to the peer w/o acking.
+    // This number dynamically changes to handle control flow.
+    max_window: u32,
 }
 
 #[derive(Debug)]
@@ -32,7 +45,7 @@ struct State {
     // acked
     peer_window: u32,
 
-    // Number of bytes that we have received but have not acked.
+    // This is the number of bytes available in our inbound receive queue.
     local_window: u32,
 
     // The instant at which the `OutQueue` was created, this is used as the
@@ -47,6 +60,7 @@ struct State {
 #[derive(Debug)]
 struct Entry {
     packet: Packet,
+    num_sends: u32,
     last_sent_at: Option<Instant>,
     acked: bool,
 }
@@ -61,10 +75,16 @@ enum Item<'a> {
     State(Packet),
 }
 
-// This should be tuneable
-const MAX_PACKET_SIZE: usize = 1_024;
+// Max size of a UDP packet... ideally this will be dynamically discovered using
+// MTU.
+const MAX_PACKET_SIZE: usize = 1_400;
+const MIN_PACKET_SIZE: usize = 150;
+
+const MAX_DATA_SIZE: usize = MAX_PACKET_SIZE - HEADER_LEN;
+const MIN_DATA_SIZE: usize = MIN_PACKET_SIZE - HEADER_LEN;
 
 const MICROS_PER_SEC: u32 = 1_000_000;
+const NANOS_PER_MS: u32 = 1_000_000;
 const NANOS_PER_MICRO: u32 = 1_000;
 
 impl OutQueue {
@@ -80,11 +100,15 @@ impl OutQueue {
                 seq_nr: seq_nr,
                 local_ack: local_ack,
                 last_ack: None,
-                peer_window: MAX_WINDOW_SIZE,
+                peer_window: MAX_WINDOW_SIZE as u32,
                 local_window: 0,
                 created_at: Instant::now(),
                 their_delay: 0,
-            }
+            },
+            rtt: 0,
+            rtt_variance: 0,
+            // Start the max window at the packet size
+            max_window: MAX_PACKET_SIZE as u32,
         }
     }
 
@@ -101,6 +125,8 @@ impl OutQueue {
     }
 
     pub fn set_their_ack(&mut self, ack_nr: u16) {
+        let now = Instant::now();
+
         loop {
             let pop = self.packets.front()
                 .map(|entry| {
@@ -120,7 +146,22 @@ impl OutQueue {
                 return;
             }
 
-            self.packets.pop_front();
+            // The packet has been acked..
+            let p = self.packets.pop_front().unwrap();
+
+            if p.num_sends == 1 {
+                // Use the packet to update rtt & rtt_variance
+                let packet_rtt = as_ms(now.duration_since(p.last_sent_at.unwrap()));
+                let delta = (self.rtt as i64 - packet_rtt as i64).abs();
+
+                self.rtt_variance += (delta - self.rtt_variance) / 4;
+
+                if self.rtt >= packet_rtt {
+                    self.rtt -= (self.rtt - packet_rtt) / 8;
+                } else {
+                    self.rtt += (packet_rtt - self.rtt) / 8;
+                }
+            }
         }
     }
 
@@ -137,6 +178,18 @@ impl OutQueue {
         self.state.local_ack = Some(val);
     }
 
+    /// Returns the socket timeout based on an aggregate of packet round trip
+    /// times.
+    pub fn socket_timeout(&self) -> Duration {
+        let timeout = self.rtt as i64 + self.rtt_variance;
+
+        if timeout > 500 {
+            Duration::from_millis(timeout as u64)
+        } else {
+            Duration::from_millis(500)
+        }
+    }
+
     /// Push an outbound packet into the queue
     pub fn push(&mut self, mut packet: Packet) {
         assert!(packet.ty() != packet::Type::State);
@@ -150,10 +203,12 @@ impl OutQueue {
         // Set the sequence number
         packet.set_seq_nr(self.state.seq_nr);
 
-        self.state.seq_nr.wrapping_add(1);
+        // Increment the seq_nr
+        self.state.seq_nr = self.state.seq_nr.wrapping_add(1);
 
         self.packets.push_back(Entry {
             packet: packet,
+            num_sends: 0,
             last_sent_at: None,
             acked: false,
         });
@@ -202,18 +257,41 @@ impl OutQueue {
         None
     }
 
-    pub fn write(&mut self, src: &[u8]) -> io::Result<usize> {
+    /// Push data into the outbound queue
+    pub fn write(&mut self, mut src: &[u8]) -> io::Result<usize> {
         if src.len() == 0 {
             return Ok(0);
         }
 
-        // TODO: Only write until the window is full
-        for chunk in src.chunks(MAX_PACKET_SIZE) {
-            let packet = Packet::data(chunk);
-            self.push(packet);
+        let cur_window = self.in_flight();
+        let max = cmp::min(self.max_window, self.state.peer_window) as usize;
+
+        if cur_window >= max {
+            return Err(io::ErrorKind::WouldBlock.into());
         }
 
-        Ok(src.len())
+        let mut rem = max - cur_window;
+        let mut len = 0;
+
+        while rem > HEADER_LEN {
+            let packet_len = cmp::min(
+                MAX_PACKET_SIZE,
+                cmp::min(src.len(), rem - HEADER_LEN));
+
+            if packet_len == 0 {
+                break;
+            }
+
+            let packet = Packet::data(&src[..packet_len]);
+            self.push(packet);
+
+            len += packet_len;
+            rem -= packet_len + HEADER_LEN;
+
+            src = &src[packet_len..];
+        }
+
+        Ok(len)
     }
 
     pub fn is_writable(&self) -> bool {
@@ -249,6 +327,10 @@ impl<'a> Next<'a> {
 
     pub fn sent(mut self) {
         if let Item::Entry(ref mut e) = self.item {
+            // Increment the number of sends
+            e.num_sends += 1;
+
+            // Track the time
             e.last_sent_at = Some(Instant::now());
         }
 
@@ -261,4 +343,14 @@ fn as_micros(duration: Duration) -> u32 {
     let mut ret = duration.as_secs().wrapping_mul(MICROS_PER_SEC as u64) as u32;
     ret += duration.subsec_nanos() / NANOS_PER_MICRO;
     ret
+}
+
+fn as_ms(duration: Duration) -> u64 {
+    // Lets just limit to 30 seconds
+    if duration.as_secs() > 30 {
+        30_000
+    } else {
+        let sub_secs = duration.subsec_nanos() / NANOS_PER_MS;
+        duration.as_secs() * 1000 + sub_secs as u64
+    }
 }

@@ -132,6 +132,16 @@ impl InQueue {
         !self.data.is_empty()
     }
 
+    pub fn local_window(&self) -> usize {
+        let pending = self.bytes_pending();
+
+        if pending >= MAX_WINDOW_SIZE {
+            0
+        } else {
+            MAX_WINDOW_SIZE - pending
+        }
+    }
+
     pub fn bytes_pending(&self) -> usize {
         self.data.iter()
             .map(|p| p.get_ref().len())

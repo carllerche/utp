@@ -125,12 +125,15 @@ const MAX_BUFFER_SIZE: usize = 64 * 1_024;
 const DEFAULT_IN_BUFFER_SIZE: usize = 64 * 1024;
 const DEFAULT_OUT_BUFFER_SIZE: usize = 4 * 1024;
 const MAX_CONNECTIONS_PER_SOCKET: usize = 2 * 1024;
-const MAX_SEND_SIZE: usize = 1400;
 
 impl UtpSocket {
     /// Bind a new `UtpSocket` to the given socket address
     pub fn bind(addr: &SocketAddr) -> io::Result<(UtpSocket, UtpListener)> {
         UdpSocket::bind(addr).map(UtpSocket::from_socket)
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.borrow().shared.socket.local_addr()
     }
 
     /// Create a new `Utpsocket` backed by the provided `UdpSocket`.
@@ -219,6 +222,11 @@ impl Evented for UtpListener {
 }
 
 impl UtpStream {
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        let inner = self.inner.borrow();
+        inner.shared.socket.local_addr()
+    }
+
     pub fn read(&self, dst: &mut [u8]) -> io::Result<usize> {
         let mut inner = self.inner.borrow_mut();
         let connection = &mut inner.connections[self.token];
@@ -235,12 +243,30 @@ impl UtpStream {
                     unreachable!();
                 }
             }
-            ret => ret,
+            ret => {
+                connection.update_local_window();
+                ret
+            }
         }
     }
 
     pub fn write(&self, src: &[u8]) -> io::Result<usize> {
         self.inner.borrow_mut().write(self.token, src)
+    }
+}
+
+#[cfg(test)]
+impl UtpStream {
+    pub fn is_readable(&self) -> bool {
+        let inner = self.inner.borrow();
+        let connection = &inner.connections[self.token];
+        connection.set_readiness.readiness().is_readable()
+    }
+
+    pub fn is_writable(&self) -> bool {
+        let inner = self.inner.borrow();
+        let connection = &inner.connections[self.token];
+        connection.set_readiness.readiness().is_writable()
     }
 }
 
@@ -300,7 +326,9 @@ impl Inner {
         let conn = &mut self.connections[token];
 
         if conn.state != State::Connected {
-            assert!(conn.state.is_closed());
+            assert!(conn.state.is_closed(),
+                    "expected closed state; actual={:?}", conn.state);
+
             // TODO: What should this return
             return Err(io::ErrorKind::BrokenPipe.into());
         }
@@ -389,6 +417,8 @@ impl Inner {
     }
 
     fn ready(&mut self, ready: Ready, inner: &InnerCell) -> io::Result<()> {
+        trace!("Socket::ready; ready={:?}", ready);
+
         // Update readiness
         self.shared.update_ready(ready);
 
@@ -404,6 +434,8 @@ impl Inner {
                 }
                 Err(e) => return Err(e),
             };
+
+            trace!("recv_from; addr={:?}; packet={:?}", addr, packet);
 
             match self.process(packet, addr, inner) {
                 Ok(_) => {}
@@ -523,8 +555,6 @@ impl Inner {
         // Try loading the header
         let packet = try!(Packet::parse(self.in_buf.take()));
 
-        trace!("recv_from; addr={:?}; packet={:?}", addr, packet);
-
         Ok((packet, addr))
     }
 
@@ -564,8 +594,13 @@ impl Shared {
 }
 
 impl Connection {
+    fn update_local_window(&mut self) {
+        self.out_queue.set_local_window(self.in_queue.local_window());
+    }
+
     /// Process an inbound packet for the connection
     fn process(&mut self, packet: Packet, shared: &mut Shared) -> io::Result<bool> {
+
         // Use the packet to update the delay value
         self.out_queue.set_their_delay(packet.timestamp());
         self.out_queue.set_their_ack(packet.ack_nr());
@@ -578,6 +613,8 @@ impl Connection {
             if self.state == State::SynSent {
                 self.in_queue.set_initial_ack_nr(packet.seq_nr());
                 self.state = State::Connected;
+
+                self.out_queue.set_local_ack(self.in_queue.ack_nr());
             }
         } else {
             // Add the packet to the inbound queue. This handles ordering
@@ -585,10 +622,12 @@ impl Connection {
             self.in_queue.push(packet);
         }
 
-        while let Some(packet) = self.in_queue.poll() {
-            trace!("processing inbound; packet={:?}", packet);
+        trace!("polling from in_queue");
 
-            self.out_queue.set_local_window(self.in_queue.bytes_pending());
+        while let Some(packet) = self.in_queue.poll() {
+            trace!("process; packet={:?}; state={:?}", packet, self.state);
+
+            self.update_local_window();
             self.out_queue.set_local_ack(self.in_queue.ack_nr());
 
             // At this point, we only receive CTL frames. Data is held in the

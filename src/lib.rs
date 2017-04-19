@@ -15,8 +15,14 @@ mod packet;
 mod socket;
 mod util;
 
+#[cfg(test)]
+extern crate env_logger;
+
+#[cfg(test)]
+mod test;
+
 pub use socket::{UtpSocket, UtpStream, UtpListener};
 
 // max window size
-const MAX_WINDOW_SIZE: u32 = 1_024 * 1_024;
+const MAX_WINDOW_SIZE: usize = 64 * 1_024;
 const MAX_DELTA_SEQ: usize = 32;

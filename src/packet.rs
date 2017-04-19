@@ -33,6 +33,8 @@ pub enum Type {
     Syn = 4,
 }
 
+pub const HEADER_LEN: usize = 20;
+
 const DEFAULT: [u8; 20] = [
     1, 0, 0, 0,
     0, 0, 0, 0,
@@ -41,7 +43,6 @@ const DEFAULT: [u8; 20] = [
     0, 0, 0, 0];
 
 const VERSION_MASK: u8 = 0b1111;
-const HEADER_LEN: usize = 20;
 
 impl Packet {
     pub fn parse(packet: BytesMut) -> io::Result<Packet> {
