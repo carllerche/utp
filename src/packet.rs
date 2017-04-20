@@ -19,6 +19,7 @@ use std::{fmt, io};
 /// | seq_nr                        | ack_nr                        |
 /// +---------------+---------------+---------------+---------------+
 /// ```
+#[derive(Clone)]
 pub struct Packet {
     data: BytesMut,
 }

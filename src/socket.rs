@@ -374,7 +374,7 @@ impl Inner {
         }
 
         // SYN packet has seq_nr of 1
-        let mut out_queue = OutQueue::new(send_id, 1, None);
+        let mut out_queue = OutQueue::new(send_id, 0, None);
 
         let mut packet = Packet::syn();
         packet.set_connection_id(key.receive_id);
@@ -408,6 +408,7 @@ impl Inner {
         let finalized = {
             let conn = &mut self.connections[token];
             conn.send_fin(false, &mut self.shared);
+            conn.flush(&mut self.shared);
             conn.is_finalized()
         };
 
@@ -417,7 +418,7 @@ impl Inner {
     }
 
     fn ready(&mut self, ready: Ready, inner: &InnerCell) -> io::Result<()> {
-        trace!("Socket::ready; ready={:?}", ready);
+        trace!("ready; ready={:?}", ready);
 
         // Update readiness
         self.shared.update_ready(ready);
@@ -430,9 +431,13 @@ impl Inner {
             let (packet, addr) = match self.recv_from() {
                 Ok(v) => v,
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    trace!("ready -> would block");
                     break;
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    trace!("recv_from; error={:?}", e);
+                    return Err(e);
+                }
             };
 
             trace!("recv_from; addr={:?}; packet={:?}", addr, packet);
@@ -600,7 +605,6 @@ impl Connection {
 
     /// Process an inbound packet for the connection
     fn process(&mut self, packet: Packet, shared: &mut Shared) -> io::Result<bool> {
-
         // Use the packet to update the delay value
         self.out_queue.set_their_delay(packet.timestamp());
         self.out_queue.set_their_ack(packet.ack_nr());
@@ -612,9 +616,9 @@ impl Connection {
             // connection into the connected state.
             if self.state == State::SynSent {
                 self.in_queue.set_initial_ack_nr(packet.seq_nr());
-                self.state = State::Connected;
+                self.out_queue.set_local_ack(packet.seq_nr());
 
-                self.out_queue.set_local_ack(self.in_queue.ack_nr());
+                self.state = State::Connected;
             }
         } else {
             // Add the packet to the inbound queue. This handles ordering
@@ -626,9 +630,6 @@ impl Connection {
 
         while let Some(packet) = self.in_queue.poll() {
             trace!("process; packet={:?}; state={:?}", packet, self.state);
-
-            self.update_local_window();
-            self.out_queue.set_local_ack(self.in_queue.ack_nr());
 
             // At this point, we only receive CTL frames. Data is held in the
             // queue
@@ -644,6 +645,13 @@ impl Connection {
                     packet::Type::State => unreachable!(),
             }
         }
+
+        trace!("updating local window, acks; window={:?}; ack={:?}",
+               self.in_queue.local_window(),
+               self.in_queue.ack_nr());
+
+        self.update_local_window();
+        self.out_queue.set_local_ack(self.in_queue.ack_nr());
 
         // Flush out queue
         self.flush(shared);
@@ -685,8 +693,6 @@ impl Connection {
 
         self.out_queue.push(Packet::fin());
         self.state = State::FinSent;
-
-        self.flush(shared);
     }
 
     fn is_finalized(&self) -> bool {

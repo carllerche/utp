@@ -42,25 +42,35 @@ impl InQueue {
     /// Poll the next CTL packet for processing. Data packets are queued for
     /// read
     pub fn poll(&mut self) -> Option<Packet> {
+        trace!("poll; ack_nr={:?}", self.ack_nr);
+
         // Get the current position, if none then no packets can be read
         let pos = match self.ack_nr {
-            Some(ack_nr) => ack_nr as usize,
+            Some(ack_nr) => (ack_nr as usize) + 1,
             None => return None,
         };
 
         loop {
             // Take the next packet
-            let p = mem::replace(&mut self.packets[pos % MAX_DELTA_SEQ], None);
+            let slot = pos % MAX_DELTA_SEQ;
+            let p = mem::replace(&mut self.packets[slot], None);
 
             let p = match p {
-                Some(p) => p,
-                None => return None,
+                Some(p) => {
+                    trace!("slot has packet; slot={:?}; packet={:?}", slot, p);
+                    p
+                }
+                None => {
+                    trace!("slot empty; slot={:?}", slot);
+                    return None;
+                }
             };
 
             // Update ack_nr
             self.ack_nr = Some((pos % u16::MAX as usize) as u16);
 
             if p.ty() == packet::Type::Data {
+                trace!(" -> got data");
                 if !p.payload().is_empty() {
                     let buf = Cursor::new(p.into_payload());
                     self.data.push_back(buf);
@@ -72,7 +82,7 @@ impl InQueue {
     }
 
     pub fn push(&mut self, packet: Packet) {
-        trace!("InQueue::push; packet={:?}", packet);
+        trace!("InQueue::push; packet={:?}; ack_nr={:?}", packet, self.ack_nr);
 
         // State packets are handled outside of this queue
         assert!(packet.ty() != packet::Type::State);
@@ -102,7 +112,7 @@ impl InQueue {
             return;
         }
 
-        trace!("    -> tracking packet");
+        trace!("    -> tracking packet; seq_nr={:?}; slot={:?}", seq_nr, slot);
 
         self.packets[slot] = Some(packet);
     }
@@ -153,12 +163,12 @@ impl InQueue {
         self.ack_nr = Some(ack_nr);
 
         // Now, we prune the queue
-        for p in self.packets.iter_mut() {
-            let unset = p.as_ref()
+        for (slot, p) in self.packets.iter_mut().enumerate() {
+            let keep = p.as_ref()
                 .map(|p| in_range(ack_nr, p.seq_nr()))
                 .unwrap_or(false);
 
-            if unset {
+            if !keep {
                 *p = None;
             }
         }

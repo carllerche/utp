@@ -22,7 +22,13 @@ fn next_u16() -> u16 {
 }
 
 #[cfg(test)]
-fn next_u16() -> u16 {
+pub use self::test::reset_rand;
+
+#[cfg(test)]
+use self::test::next_u16;
+
+#[cfg(test)]
+mod test {
     use rand::{XorShiftRng, Rng};
     use std::cell::RefCell;
 
@@ -30,5 +36,12 @@ fn next_u16() -> u16 {
         RefCell::new(XorShiftRng::new_unseeded())
     });
 
-    THREAD_RNG.with(|t| t.borrow_mut().gen::<u16>())
+    pub fn next_u16() -> u16 {
+        THREAD_RNG.with(|t| t.borrow_mut().gen::<u16>())
+    }
+
+    #[cfg(test)]
+    pub fn reset_rand() {
+        THREAD_RNG.with(|t| *t.borrow_mut() = XorShiftRng::new_unseeded());
+    }
 }

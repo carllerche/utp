@@ -175,6 +175,13 @@ impl OutQueue {
         // TODO: Since STATE packets can be lost, if any packet is received from
         // the remote, *some* sort of state packet needs to be sent out in the
         // near term future.
+
+        if self.state.local_ack.is_none() {
+            // Also update the last_ack as this is the connection's first state
+            // packet which does not need to be acked.
+            self.state.last_ack = Some(val);
+        }
+
         self.state.local_ack = Some(val);
     }
 
@@ -200,11 +207,11 @@ impl OutQueue {
             packet.set_connection_id(self.state.connection_id);
         }
 
-        // Set the sequence number
-        packet.set_seq_nr(self.state.seq_nr);
-
         // Increment the seq_nr
         self.state.seq_nr = self.state.seq_nr.wrapping_add(1);
+
+        // Set the sequence number
+        packet.set_seq_nr(self.state.seq_nr);
 
         self.packets.push_back(Entry {
             packet: packet,
@@ -239,6 +246,11 @@ impl OutQueue {
         }
 
         if self.state.local_ack != self.state.last_ack {
+            trace!("ack_required; local={:?}; last={:?}; seq_nr={:?}",
+                   self.state.local_ack,
+                   self.state.last_ack,
+                   self.state.seq_nr);
+
             let mut packet = Packet::state();
 
             packet.set_connection_id(self.state.connection_id);

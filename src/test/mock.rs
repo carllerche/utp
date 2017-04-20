@@ -69,16 +69,15 @@ impl Mock {
             return Some(buf);
         }
 
-        self.recv(ms);
+        self.recv(Duration::from_millis(ms));
 
         self.recv.get_mut(remote).and_then(|b| b.pop_front())
     }
 
     /// Receive packets into local buffer
-    fn recv(&mut self, ms: u64) {
+    fn recv(&mut self, dur: Duration) {
         let mut buf = [0; 2048];
         let now = Instant::now();
-        let dur = Duration::from_millis(ms);
 
         let mut received = false;
 
@@ -146,8 +145,22 @@ impl Mock {
         }
     }
 
+    pub fn wait(&mut self, ms: u64) {
+        let now = Instant::now();
+        let dur = Duration::from_millis(ms);
+
+        loop {
+            let elapsed = now.elapsed();
+            if elapsed >= dur {
+                return;
+            }
+
+            self.recv(dur - elapsed);
+        }
+    }
+
     pub fn assert_quiescence(&mut self, ms: u64) {
-        self.recv(ms);
+        self.recv(Duration::from_millis(ms));
 
         for (remote, buf) in &self.recv {
             if let Some(packet) = buf.front() {
