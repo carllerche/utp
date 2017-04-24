@@ -1,6 +1,6 @@
 use {UtpSocket, UtpListener, UtpStream};
 use mio::*;
-use std::io;
+use std::{cmp, io};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -83,13 +83,15 @@ impl Harness {
     pub fn tick(&self) {
         let mut events = Events::with_capacity(4);
 
-        self.poll.poll(&mut events, None).unwrap();
+        self.poll.poll(&mut events, Some(Duration::from_millis(500))).unwrap();
 
         for e in events.iter() {
             if e.token() == Token(0) {
                 self.socket.ready(e.readiness()).unwrap();
             }
         }
+
+        self.socket.tick().unwrap();
     }
 
     pub fn tick_for(&self, ms: u64) {
@@ -104,13 +106,17 @@ impl Harness {
                 return;
             }
 
-            self.poll.poll(&mut events, Some(dur - elapsed)).unwrap();
+            let wait = cmp::min(dur - elapsed, Duration::from_millis(500));
+
+            self.poll.poll(&mut events, Some(wait)).unwrap();
 
             for e in events.iter() {
                 if e.token() == Token(0) {
                     self.socket.ready(e.readiness()).unwrap();
                 }
             }
+
+            self.socket.tick().unwrap();
         }
     }
 }

@@ -112,6 +112,10 @@ impl OutQueue {
         }
     }
 
+    pub fn connection_id(&self) -> u16 {
+        self.state.connection_id
+    }
+
     /// Returns true if the out queue is fully flushed and all packets have been
     /// ACKed.
     pub fn is_empty(&self) -> bool {
@@ -187,13 +191,22 @@ impl OutQueue {
 
     /// Returns the socket timeout based on an aggregate of packet round trip
     /// times.
-    pub fn socket_timeout(&self) -> Duration {
+    pub fn socket_timeout(&self) -> Option<Duration> {
+        if self.is_empty() {
+            return None;
+        }
+
+        // Until a packet is received from the peer, the timeout is 1 second.
+        if self.state.local_ack.is_none() {
+            return Some(Duration::from_secs(1));
+        }
+
         let timeout = self.rtt as i64 + self.rtt_variance;
 
         if timeout > 500 {
-            Duration::from_millis(timeout as u64)
+            Some(Duration::from_millis(timeout as u64))
         } else {
-            Duration::from_millis(500)
+            Some(Duration::from_millis(500))
         }
     }
 
@@ -227,10 +240,18 @@ impl OutQueue {
         let ack = self.state.local_ack.unwrap_or(0);
         let wnd_size = self.state.local_window;
 
+        // Number of bytes in-flight
+        let in_flight = self.in_flight();
+
         for entry in &mut self.packets {
             // The packet has been sent
             if entry.last_sent_at.is_some() {
                 continue;
+            }
+
+            // Don't send more data than the window allows
+            if in_flight > 0 && in_flight + entry.packet.len() > self.max_window as usize {
+                return None;
             }
 
             // Update timestamp
@@ -267,6 +288,15 @@ impl OutQueue {
         }
 
         None
+    }
+
+    /// The peer timed out, consider all the packets lost
+    pub fn timed_out(&mut self) {
+        for entry in &mut self.packets {
+            entry.last_sent_at = None;
+        }
+
+        self.max_window = MIN_PACKET_SIZE as u32;
     }
 
     /// Push data into the outbound queue

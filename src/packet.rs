@@ -178,6 +178,10 @@ impl Packet {
     pub fn as_slice(&self) -> &[u8] {
         &self.data[..]
     }
+
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
 }
 
 impl Default for Packet {

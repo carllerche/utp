@@ -15,6 +15,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::net::SocketAddr;
 use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
 
 pub struct UtpSocket {
     // Shared state
@@ -95,6 +96,9 @@ struct Connection {
     // Queue of inbound packets. The queue orders packets according to their
     // sequence number.
     in_queue: InQueue,
+
+    // Activity deadline
+    deadline: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -125,6 +129,7 @@ const MAX_BUFFER_SIZE: usize = 64 * 1_024;
 const DEFAULT_IN_BUFFER_SIZE: usize = 64 * 1024;
 const DEFAULT_OUT_BUFFER_SIZE: usize = 4 * 1024;
 const MAX_CONNECTIONS_PER_SOCKET: usize = 2 * 1024;
+const DEFAULT_TIMEOUT_MS: u64 = 1_000;
 
 impl UtpSocket {
     /// Bind a new `UtpSocket` to the given socket address
@@ -171,8 +176,14 @@ impl UtpSocket {
         self.inner.borrow_mut().connect(addr, &self.inner)
     }
 
+    /// Called whenever the socket readiness changes
     pub fn ready(&self, ready: Ready) -> io::Result<()> {
         self.inner.borrow_mut().ready(ready, &self.inner)
+    }
+
+    /// This function should be called every 500ms
+    pub fn tick(&self) -> io::Result<()> {
+        self.inner.borrow_mut().tick()
     }
 }
 
@@ -390,6 +401,7 @@ impl Inner {
             set_readiness: set_readiness,
             out_queue: out_queue,
             in_queue: InQueue::new(None),
+        deadline: Some(Instant::now() + Duration::from_millis(DEFAULT_TIMEOUT_MS)),
         });
 
         // Track the connection in the lookup
@@ -452,6 +464,15 @@ impl Inner {
         }
 
         self.flush();
+        Ok(())
+    }
+
+    fn tick(&mut self) -> io::Result<()> {
+        trace!("Socket::tick");
+        for &idx in self.connection_lookup.values() {
+            try!(self.connections[idx].tick(&mut self.shared));
+        }
+
         Ok(())
     }
 
@@ -525,6 +546,7 @@ impl Inner {
             set_readiness: set_readiness,
             out_queue: OutQueue::new(send_id, seq_nr, Some(ack_nr)),
             in_queue: InQueue::new(Some(ack_nr)),
+            deadline: None,
         };
 
         // This will handle the state packet being sent
@@ -653,6 +675,9 @@ impl Connection {
         self.update_local_window();
         self.out_queue.set_local_ack(self.in_queue.ack_nr());
 
+        // Reset the timeout
+        self.reset_timeout();
+
         // Flush out queue
         self.flush(shared);
 
@@ -663,6 +688,8 @@ impl Connection {
     }
 
     fn flush(&mut self, shared: &mut Shared) {
+        let mut sent = false;
+
         while let Some(next) = self.out_queue.next() {
             if !shared.is_writable() {
                 return;
@@ -674,6 +701,9 @@ impl Connection {
                 Ok(n) => {
                     assert_eq!(n, next.packet().as_slice().len());
                     next.sent();
+
+                    // Reset the connection timeout
+                    sent = true;
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                     shared.need_writable();
@@ -684,6 +714,30 @@ impl Connection {
                 }
             }
         }
+
+        if sent {
+            self.reset_timeout();
+        }
+    }
+
+    fn tick(&mut self, shared: &mut Shared) -> io::Result<()> {
+        if let Some(deadline) = self.deadline {
+            if Instant::now() >= deadline {
+                trace!("connection timed out; id={}", self.out_queue.connection_id());
+                self.out_queue.timed_out();
+                self.flush(shared);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn reset_timeout(&mut self) {
+        self.deadline = self.out_queue.socket_timeout()
+            .map(|dur| {
+                trace!("resetting timeout; duration={:?}", dur);
+                Instant::now() + dur
+            });
     }
 
     fn send_fin(&mut self, _: bool, shared: &mut Shared) {
