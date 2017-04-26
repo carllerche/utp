@@ -81,7 +81,7 @@ impl InQueue {
         }
     }
 
-    pub fn push(&mut self, packet: Packet) {
+    pub fn push(&mut self, packet: Packet) -> bool {
         trace!("InQueue::push; packet={:?}; ack_nr={:?}", packet, self.ack_nr);
 
         // State packets are handled outside of this queue
@@ -90,7 +90,7 @@ impl InQueue {
         // Just drop if our window is full
         if self.bytes_pending() >= MAX_WINDOW_SIZE as usize {
             trace!("    -> window full; dropping packet");
-            return;
+            return false;
         }
 
         let seq_nr = packet.seq_nr();
@@ -99,7 +99,7 @@ impl InQueue {
             if !in_range(ack_nr, seq_nr) {
                 trace!("    -> not in range -- dropping");
                 // Drop the packet
-                return;
+                return false;
             }
         }
 
@@ -109,12 +109,13 @@ impl InQueue {
         if self.packets[slot].is_some() {
             trace!("    -> slot occupied -- dropping");
             // Slot already occupied, ignore the packet
-            return;
+            return false;
         }
 
         trace!("    -> tracking packet; seq_nr={:?}; slot={:?}", seq_nr, slot);
 
         self.packets[slot] = Some(packet);
+        true
     }
 
     pub fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {

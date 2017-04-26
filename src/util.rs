@@ -1,3 +1,34 @@
+use std::time::Duration;
+
+pub fn as_ms(duration: Duration) -> u64 {
+    // Lets just limit to 30 seconds
+    if duration.as_secs() > 30 {
+        30_000
+    } else {
+        let sub_secs = duration.subsec_nanos() / NANOS_PER_MS;
+        duration.as_secs() * 1000 + sub_secs as u64
+    }
+}
+
+/// Wrapping less than comparison
+pub fn wrapping_lt(lhs: u32, rhs: u32, mask: u32) -> bool {
+    let dist_dn = lhs.wrapping_sub(rhs) & mask;
+    let dist_up = rhs.wrapping_sub(lhs) & mask;
+
+    dist_up < dist_dn
+}
+
+const MICROS_PER_SEC: u32 = 1_000_000;
+const NANOS_PER_MS: u32 = 1_000_000;
+const NANOS_PER_MICRO: u32 = 1_000;
+
+pub fn as_wrapping_micros(duration: Duration) -> u32 {
+    // Wrapping is OK
+    let mut ret = duration.as_secs().wrapping_mul(MICROS_PER_SEC as u64) as u32;
+    ret += duration.subsec_nanos() / NANOS_PER_MICRO;
+    ret
+}
+
 /// Safely generates two sequential connection identifiers.
 ///
 /// This avoids an overflow when the generated receiver identifier is the largest

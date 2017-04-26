@@ -1,6 +1,6 @@
 //! Queue of outgoing packets.
 
-use MAX_WINDOW_SIZE;
+use {util, MAX_WINDOW_SIZE};
 use packet::{self, Packet, HEADER_LEN};
 
 use std::{cmp, io};
@@ -26,6 +26,10 @@ pub struct OutQueue {
     // Max number of bytes that we can have in-flight to the peer w/o acking.
     // This number dynamically changes to handle control flow.
     max_window: u32,
+
+    // Peer's window. This is the number of bytes that it has locally but not
+    // acked
+    peer_window: u32,
 }
 
 #[derive(Debug)]
@@ -40,10 +44,6 @@ struct State {
 
     // Last outbound ack
     last_ack: Option<u16>,
-
-    // Peer's window. This is the number of bytes that it has locally but not
-    // acked
-    peer_window: u32,
 
     // This is the number of bytes available in our inbound receive queue.
     local_window: u32,
@@ -100,7 +100,6 @@ impl OutQueue {
                 seq_nr: seq_nr,
                 local_ack: local_ack,
                 last_ack: None,
-                peer_window: MAX_WINDOW_SIZE as u32,
                 local_window: 0,
                 created_at: Instant::now(),
                 their_delay: 0,
@@ -109,6 +108,7 @@ impl OutQueue {
             rtt_variance: 0,
             // Start the max window at the packet size
             max_window: MAX_PACKET_SIZE as u32,
+            peer_window: MAX_WINDOW_SIZE as u32,
         }
     }
 
@@ -123,13 +123,19 @@ impl OutQueue {
     }
 
     /// Whenever a packet is received, the included timestamp is passed in here.
-    pub fn set_their_delay(&mut self, their_timestamp: u32) {
-        let our_timestamp = as_micros(self.state.created_at.elapsed());
+    pub fn update_their_delay(&mut self, their_timestamp: u32) -> u32 {
+        let our_timestamp = util::as_wrapping_micros(self.state.created_at.elapsed());
         self.state.their_delay = our_timestamp.wrapping_sub(their_timestamp);
+        self.state.their_delay
     }
 
-    pub fn set_their_ack(&mut self, ack_nr: u16) {
-        let now = Instant::now();
+    pub fn set_peer_window(&mut self, val: u32) {
+        self.peer_window = val;
+    }
+
+    pub fn set_their_ack(&mut self, ack_nr: u16, now: Instant) -> Option<(usize, Duration)> {
+        let mut acked_bytes = 0;
+        let mut min_rtt = None;
 
         loop {
             let pop = self.packets.front()
@@ -147,15 +153,25 @@ impl OutQueue {
                 .unwrap_or(false);
 
             if !pop {
-                return;
+                return min_rtt.map(|rtt| (acked_bytes, rtt));
             }
 
             // The packet has been acked..
             let p = self.packets.pop_front().unwrap();
 
+            // If the packet has a payload, track the number of bytes sent
+            acked_bytes += p.packet.payload().len();
+
+            // Calculate the RTT for the packet.
+            let packet_rtt = now.duration_since(p.last_sent_at.unwrap());
+
+            min_rtt = Some(min_rtt
+                .map(|curr| cmp::min(curr, packet_rtt))
+                .unwrap_or(packet_rtt));
+
             if p.num_sends == 1 {
                 // Use the packet to update rtt & rtt_variance
-                let packet_rtt = as_ms(now.duration_since(p.last_sent_at.unwrap()));
+                let packet_rtt = util::as_ms(now.duration_since(p.last_sent_at.unwrap()));
                 let delta = (self.rtt as i64 - packet_rtt as i64).abs();
 
                 self.rtt_variance += (delta - self.rtt_variance) / 4;
@@ -249,9 +265,18 @@ impl OutQueue {
                 continue;
             }
 
-            // Don't send more data than the window allows
-            if in_flight > 0 && in_flight + entry.packet.len() > self.max_window as usize {
-                return None;
+            if in_flight > 0 {
+                let max = cmp::min(self.max_window, self.peer_window) as usize;
+
+                // Don't send more data than the window allows
+                if in_flight + entry.packet.len() > max {
+                    return None;
+                }
+            } else {
+                // Don't send more data than the window allows
+                if in_flight + entry.packet.len() > self.peer_window as usize {
+                    return None;
+                }
             }
 
             // Update timestamp
@@ -290,6 +315,14 @@ impl OutQueue {
         None
     }
 
+    pub fn max_window(&self) -> u32 {
+        self.max_window
+    }
+
+    pub fn set_max_window(&mut self, val: u32) {
+        self.max_window = val;
+    }
+
     /// The peer timed out, consider all the packets lost
     pub fn timed_out(&mut self) {
         for entry in &mut self.packets {
@@ -306,7 +339,7 @@ impl OutQueue {
         }
 
         let cur_window = self.in_flight();
-        let max = cmp::min(self.max_window, self.state.peer_window) as usize;
+        let max = cmp::min(self.max_window, self.peer_window) as usize;
 
         if cur_window >= max {
             return Err(io::ErrorKind::WouldBlock.into());
@@ -355,7 +388,7 @@ impl OutQueue {
     }
 
     fn timestamp(&self) -> u32 {
-        as_micros(self.state.created_at.elapsed())
+        util::as_wrapping_micros(self.state.created_at.elapsed())
     }
 }
 
@@ -377,22 +410,5 @@ impl<'a> Next<'a> {
         }
 
         self.state.last_ack = self.state.local_ack;
-    }
-}
-
-fn as_micros(duration: Duration) -> u32 {
-    // Wrapping is OK
-    let mut ret = duration.as_secs().wrapping_mul(MICROS_PER_SEC as u64) as u32;
-    ret += duration.subsec_nanos() / NANOS_PER_MICRO;
-    ret
-}
-
-fn as_ms(duration: Duration) -> u64 {
-    // Lets just limit to 30 seconds
-    if duration.as_secs() > 30 {
-        30_000
-    } else {
-        let sub_secs = duration.subsec_nanos() / NANOS_PER_MS;
-        duration.as_secs() * 1000 + sub_secs as u64
     }
 }

@@ -39,8 +39,8 @@ pub const HEADER_LEN: usize = 20;
 const DEFAULT: [u8; 20] = [
     1, 0, 0, 0,
     0, 0, 0, 0,
-    0, 0, 0, 0,
-    0, 0, 0, 0,
+    255, 255, 255, 255, // Default timestamp difference
+    0, 1, 0, 0,         // Default window of 64kb
     0, 0, 0, 0];
 
 const VERSION_MASK: u8 = 0b1111;

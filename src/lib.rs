@@ -9,6 +9,7 @@ extern crate byteorder;
 #[macro_use]
 extern crate log;
 
+mod delays;
 mod in_queue;
 mod out_queue;
 mod packet;
@@ -26,3 +27,4 @@ pub use socket::{UtpSocket, UtpStream, UtpListener};
 // max window size
 const MAX_WINDOW_SIZE: usize = 64 * 1_024;
 const MAX_DELTA_SEQ: usize = 32;
+const TIMESTAMP_MASK: u32 = 0xFFFFFFFF;

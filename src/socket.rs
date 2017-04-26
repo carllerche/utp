@@ -1,4 +1,5 @@
-use util;
+use {util, TIMESTAMP_MASK};
+use delays::Delays;
 use in_queue::InQueue;
 use out_queue::OutQueue;
 use packet::{self, Packet};
@@ -10,7 +11,7 @@ use rand;
 use bytes::{BytesMut, BufMut};
 use slab::Slab;
 
-use std::io;
+use std::{cmp, io, u32};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::net::SocketAddr;
@@ -99,6 +100,20 @@ struct Connection {
 
     // Activity deadline
     deadline: Option<Instant>,
+
+    // Tracks delays for the congestion control algorithm
+    our_delays: Delays,
+
+    their_delays: Delays,
+
+    last_maxed_out_window: Instant,
+    average_delay: u32,
+    current_delay_sum: i64,
+    current_delay_samples: i64,
+    average_delay_base: u32,
+    average_sample_time: Instant,
+    clock_drift: i32,
+    slow_start: bool,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -130,6 +145,12 @@ const DEFAULT_IN_BUFFER_SIZE: usize = 64 * 1024;
 const DEFAULT_OUT_BUFFER_SIZE: usize = 4 * 1024;
 const MAX_CONNECTIONS_PER_SOCKET: usize = 2 * 1024;
 const DEFAULT_TIMEOUT_MS: u64 = 1_000;
+const TARGET_DELAY: u32 = 100_000; // 100ms in micros
+
+const SLOW_START_THRESHOLD: usize = DEFAULT_IN_BUFFER_SIZE;
+const MAX_CWND_INCREASE_BYTES_PER_RTT: usize = 3000;
+const MIN_WINDOW_SIZE: usize = 10;
+const MAX_DATA_SIZE: usize = 1_400 - 20;
 
 impl UtpSocket {
     /// Bind a new `UtpSocket` to the given socket address
@@ -350,6 +371,7 @@ impl Inner {
                 Ok(n)
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                conn.last_maxed_out_window = Instant::now();
                 try!(conn.update_readiness());
                 Err(io::ErrorKind::WouldBlock.into())
             }
@@ -394,6 +416,7 @@ impl Inner {
         out_queue.push(packet);
 
         let (registration, set_readiness) = Registration::new2();
+        let now = Instant::now();
 
         let token = self.connections.insert(Connection {
             state: State::SynSent,
@@ -401,7 +424,17 @@ impl Inner {
             set_readiness: set_readiness,
             out_queue: out_queue,
             in_queue: InQueue::new(None),
-        deadline: Some(Instant::now() + Duration::from_millis(DEFAULT_TIMEOUT_MS)),
+            our_delays: Delays::new(),
+            their_delays: Delays::new(),
+            deadline: Some(now + Duration::from_millis(DEFAULT_TIMEOUT_MS)),
+            last_maxed_out_window: now,
+            average_delay: 0,
+            current_delay_sum: 0,
+            current_delay_samples: 0,
+            average_delay_base: 0,
+            average_sample_time: now,
+            clock_drift: 0,
+            slow_start: true,
         });
 
         // Track the connection in the lookup
@@ -540,13 +573,25 @@ impl Inner {
             unimplemented!();
         }
 
+        let now = Instant::now();
+
         let mut connection = Connection {
             state: State::SynRecv,
             key: key.clone(),
             set_readiness: set_readiness,
             out_queue: OutQueue::new(send_id, seq_nr, Some(ack_nr)),
             in_queue: InQueue::new(Some(ack_nr)),
+            our_delays: Delays::new(),
+            their_delays: Delays::new(),
             deadline: None,
+            last_maxed_out_window: now,
+            average_delay: 0,
+            current_delay_sum: 0,
+            current_delay_samples: 0,
+            average_delay_base: 0,
+            average_sample_time: now,
+            clock_drift: 0,
+            slow_start: true,
         };
 
         // This will handle the state packet being sent
@@ -627,9 +672,11 @@ impl Connection {
 
     /// Process an inbound packet for the connection
     fn process(&mut self, packet: Packet, shared: &mut Shared) -> io::Result<bool> {
-        // Use the packet to update the delay value
-        self.out_queue.set_their_delay(packet.timestamp());
-        self.out_queue.set_their_ack(packet.ack_nr());
+        let now = Instant::now();
+
+        // TODO: Invalid packets should be discarded here.
+
+        self.update_delays(now, &packet);
 
         if packet.ty() == packet::Type::State {
             // State packets are special, they do not have an associated
@@ -639,19 +686,31 @@ impl Connection {
             if self.state == State::SynSent {
                 self.in_queue.set_initial_ack_nr(packet.seq_nr());
                 self.out_queue.set_local_ack(packet.seq_nr());
+                self.out_queue.set_peer_window(packet.wnd_size());
 
                 self.state = State::Connected;
             }
         } else {
+            // TODO: validate the packet's ack_nr
+
             // Add the packet to the inbound queue. This handles ordering
             trace!("inqueue -- push packet");
-            self.in_queue.push(packet);
+            if !self.in_queue.push(packet) {
+                // Invalid packet, avoid any further processing
+                trace!("invalid packet");
+                return Ok(false);
+            }
         }
+
+        // TODO: count duplicate ACK counter
 
         trace!("polling from in_queue");
 
         while let Some(packet) = self.in_queue.poll() {
             trace!("process; packet={:?}; state={:?}", packet, self.state);
+
+            // Update the peer window size
+            self.out_queue.set_peer_window(packet.wnd_size());
 
             // At this point, we only receive CTL frames. Data is held in the
             // queue
@@ -730,6 +789,167 @@ impl Connection {
         }
 
         Ok(())
+    }
+
+    fn update_delays(&mut self, now: Instant, packet: &Packet) {
+        let mut actual_delay = u32::MAX;
+
+        if packet.timestamp() > 0 {
+            // Use the packet to update the delay value
+            let their_delay = self.out_queue.update_their_delay(packet.timestamp());
+            let prev_base_delay = self.their_delays.base_delay();
+
+            // Track the delay
+            self.their_delays.add_sample(their_delay, now);
+
+            if let Some(prev) = prev_base_delay {
+                let new = self.their_delays.base_delay().unwrap();
+
+                // If their new base delay is less than their previous one, we
+                // should shift our delay base in the other direction in order
+                // to take the clock skew into account.
+                let lt = util::wrapping_lt(new, prev, TIMESTAMP_MASK);
+                let diff = prev.wrapping_sub(new);
+
+                if lt && diff <= 10_000 {
+                    self.our_delays.shift(diff);
+                }
+            }
+
+            actual_delay = packet.timestamp_diff();
+
+            if actual_delay != u32::MAX {
+                self.our_delays.add_sample(actual_delay, now);
+
+                if self.average_delay_base == 0 {
+                    self.average_delay_base = actual_delay;
+                }
+
+                let mut average_delay_sample = 0;
+                let dist_down = self.average_delay_base.wrapping_sub(actual_delay);
+                let dist_up = actual_delay.wrapping_sub(self.average_delay_base);
+
+                if dist_down > dist_up {
+                    average_delay_sample = dist_up as i64;
+                } else {
+                    average_delay_sample = -(dist_down as i64);
+                }
+
+                self.current_delay_sum = self.current_delay_sum.wrapping_add(average_delay_sample);
+                self.current_delay_samples += 1;
+
+                if now > self.average_sample_time {
+                    let mut prev_average_delay = self.average_delay;
+                    self.average_delay = (self.current_delay_sum / self.current_delay_samples) as u32;
+                    self.average_sample_time = now + Duration::from_secs(5);
+
+                    self.current_delay_sum = 0;
+                    self.current_delay_samples = 0;
+
+                    let min_sample = cmp::min(prev_average_delay, self.average_delay);
+                    let max_sample = cmp::max(prev_average_delay, self.average_delay);
+
+                    let mut adjust = 0;
+
+                    if min_sample > 0 {
+                        adjust = min_sample;
+                    } else if max_sample < 0 {
+                        adjust = max_sample;
+                    }
+
+                    if adjust != 0 {
+                        self.average_delay_base += adjust;
+                        self.average_delay -= adjust;
+                        prev_average_delay -= adjust;
+                    }
+
+                    // Update the clock drive estimate
+                    let drift = self.average_delay as i64 - prev_average_delay as i64;
+
+                    self.clock_drift = ((self.clock_drift as i64 * 7 + drift) / 8) as i32;
+                }
+            }
+        }
+
+        // Ack all packets
+        if let Some((acked_bytes, min_rtt)) = self.out_queue.set_their_ack(packet.ack_nr(), now) {
+            let min_rtt = util::as_wrapping_micros(min_rtt);
+
+            if let Some(delay) = self.our_delays.get() {
+                if delay > min_rtt {
+                    self.our_delays.shift(delay.wrapping_sub(min_rtt));
+                }
+            }
+
+            if actual_delay != u32::MAX && acked_bytes >= 1 {
+                self.apply_congestion_control(acked_bytes, actual_delay, min_rtt, now);
+            }
+        }
+    }
+
+    fn apply_congestion_control(&mut self,
+                                bytes_acked: usize,
+                                actual_delay: u32,
+                                min_rtt: u32,
+                                now: Instant)
+    {
+        trace!("applying congenstion control; bytes_acked={}; actual_delay={}; min_rtt={}",
+               bytes_acked, actual_delay, min_rtt);
+
+        let target = TARGET_DELAY;
+
+        let mut our_delay = cmp::min(self.our_delays.get().unwrap(), min_rtt);
+        let mut penalty = 0;
+        let max_window = self.out_queue.max_window() as usize;
+
+        if self.clock_drift < -200_000 {
+            penalty = (-self.clock_drift - 200_000) / 7;
+
+            if penalty > 0 {
+                our_delay += penalty as u32;
+            } else {
+                our_delay -= (-penalty) as u32;
+            }
+        }
+
+        let off_target = (target - our_delay) as f64;
+        let window_factor =
+            cmp::min(bytes_acked, max_window) as f64 /
+            cmp::max(max_window, bytes_acked) as f64;
+
+        let delay_factor = off_target / target as f64;
+        let mut scaled_gain = MAX_CWND_INCREASE_BYTES_PER_RTT as f64 *
+            window_factor * delay_factor;
+
+        if scaled_gain > 0.0 && now - self.last_maxed_out_window > Duration::from_secs(1) {
+            // if it was more than 1 second since we tried to send a packet and
+            // stopped because we hit the max window, we're most likely rate
+            // limited (which prevents us from ever hitting the window size) if
+            // this is the case, we cannot let the max_window grow indefinitely
+            scaled_gain = 0.0;
+        }
+
+        let ledbat_cwnd = if max_window + (scaled_gain as usize) < MIN_WINDOW_SIZE {
+            MIN_WINDOW_SIZE
+        } else {
+            max_window + scaled_gain as usize
+        };
+
+        if self.slow_start {
+            let ss_cwnd = max_window + window_factor as usize * MAX_DATA_SIZE;
+
+            if ss_cwnd > SLOW_START_THRESHOLD {
+                self.slow_start = false;
+            } else if our_delay > (target as f64 * 0.9) as u32 {
+                // Even if we're a little under the target delay, we
+                // conservatively discontinue the slow start phase
+                self.slow_start = false;
+            } else {
+                self.out_queue.set_max_window(cmp::max(ss_cwnd, ledbat_cwnd) as u32);
+            }
+        } else {
+            self.out_queue.set_max_window(ledbat_cwnd as u32);
+        }
     }
 
     fn reset_timeout(&mut self) {
