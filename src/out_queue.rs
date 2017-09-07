@@ -281,7 +281,7 @@ impl OutQueue {
                 }
             } else {
                 // Don't send more data than the window allows
-                if in_flight + entry.packet.len() > self.peer_window as usize {
+                if entry.packet.len() > self.peer_window as usize {
                     return None;
                 }
             }
